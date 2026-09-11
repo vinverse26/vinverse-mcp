@@ -3,3 +3,4 @@ httpx==0.27.2
 python-dotenv==1.0.1
 google-auth>=2.29.0
 pyjwt>=2.8.0
+requests>=2.31.0

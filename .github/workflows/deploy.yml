@@ -47,3 +47,13 @@ jobs:
           cluster: default
           container-port: 8001
           health-check-path: /health
+          environment-variables: |
+            [
+              {"name": "APPLICATION_API_URL", "value": "${{ secrets.APPLICATION_API_URL }}"},
+              {"name": "INTERNAL_API_KEY", "value": "${{ secrets.INTERNAL_API_KEY }}"},
+              {"name": "MCP_PORT", "value": "8001"},
+              {"name": "GOOGLE_CLIENT_ID", "value": "${{ secrets.GOOGLE_CLIENT_ID }}"},
+              {"name": "SESSION_SECRET", "value": "${{ secrets.SESSION_SECRET }}"},
+              {"name": "ALLOWED_EMAILS", "value": "${{ secrets.ALLOWED_EMAILS }}"},
+              {"name": "FRONTEND_ORIGINS", "value": "${{ secrets.FRONTEND_ORIGINS }}"}
+            ]

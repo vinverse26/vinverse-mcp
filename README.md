@@ -1,15 +1,31 @@
 # Vinverse MCP Server
 
 Exposes Vinverse project data (state, documents, membership) as MCP tools, so
-the [LLM Orchestrator](../vinverse-llm-orchestrator) can fetch exactly the
-context it needs via the Model Context Protocol instead of trusting whatever
-the caller hands it.
+the [LLM Orchestrator](../vinverse-llm) can fetch exactly the context it
+needs via the Model Context Protocol instead of trusting whatever the caller
+hands it.
 
-This service owns no data itself. Every tool call turns into an HTTP request
-to the [Application API](../vinverse-platform/backend)'s `/internal/*`
-endpoints, authenticated with a shared secret (`INTERNAL_API_KEY`) rather than
-per-user JWTs — this is a service-to-service call, not a user acting on their
-own behalf.
+The MCP tools below own no data themselves. Each one turns into an HTTP
+request to an Application API's `/internal/*` endpoints, authenticated with
+a shared secret (`INTERNAL_API_KEY`) rather than per-user JWTs — a
+service-to-service call, not a user acting on their own behalf. That
+Application API is a separate piece you still need to stand up (or point
+`APPLICATION_API_URL` at once it exists).
+
+## Also handles: Google Sign-In for vinverse-ui
+
+This service additionally exposes plain REST endpoints
+(`/api/auth/google`, `/api/auth/logout`, `/api/auth/session`,
+`/api/auth/register`) that `vinverse-ui` calls directly for login. These
+ride alongside the MCP protocol on the same Starlette app but are otherwise
+unrelated to the tools below — they authenticate real users with a session
+cookie, not the `INTERNAL_API_KEY` machine-to-machine path.
+
+Worth knowing: this collapses two different trust boundaries (public
+user-facing auth, and an internal service-to-service tool layer) into one
+process. That's a pragmatic call for now — if this ever needs to scale or
+be secured independently, auth is the piece that should move to its own
+service first.
 
 ## Tools exposed
 

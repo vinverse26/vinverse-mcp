@@ -19,15 +19,42 @@ stdio transport and have the Orchestrator spawn this process directly instead
 of connecting over HTTP.
 """
 import os
+import time
+
 import httpx
+import jwt
+from google.auth.transport import requests as google_requests
+from google.oauth2 import id_token as google_id_token
 from mcp.server.fastmcp import FastMCP
 from starlette.requests import Request
-from starlette.responses import PlainTextResponse
+from starlette.responses import JSONResponse, PlainTextResponse, Response
 
 APPLICATION_API_URL = os.getenv("APPLICATION_API_URL", "http://localhost:8000")
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "dev-internal-key-change-me")
 
 HEADERS = {"X-Internal-Key": INTERNAL_API_KEY}
+
+# --- Google Sign-In config. No client secret needed -- verifying an ID
+#     token only needs the client ID it was issued for (the "audience"). ---
+GOOGLE_CLIENT_ID = os.environ["GOOGLE_CLIENT_ID"]
+SESSION_SECRET = os.environ["SESSION_SECRET"]
+ALLOWED_EMAILS = {
+    e.strip().lower()
+    for e in os.environ.get("ALLOWED_EMAILS", "").split(",")
+    if e.strip()
+}
+FRONTEND_ORIGINS = {
+    o.strip()
+    for o in os.environ.get(
+        "FRONTEND_ORIGINS",
+        "https://vinverse.ai,https://www.vinverse.ai,http://localhost:5173",
+    ).split(",")
+    if o.strip()
+}
+SESSION_COOKIE_NAME = "vinverse_session"
+SESSION_TTL_SECONDS = 60 * 60 * 24 * 7  # 7 days
+_google_request = google_requests.Request()
+_pending_registrations: list[dict] = []  # in-memory placeholder, no DB yet
 
 mcp = FastMCP(
     "vinverse-mcp-server",
@@ -40,6 +67,156 @@ mcp = FastMCP(
 async def health_check(request: Request) -> PlainTextResponse:
     """Plain HTTP health check for the ALB — separate from the MCP protocol itself."""
     return PlainTextResponse("OK")
+
+
+# ============================================================================
+# Google Sign-In endpoints, called directly by vinverse-ui (src/api/auth.js).
+# These are plain REST routes riding alongside the MCP protocol on the same
+# Starlette app -- unrelated to the MCP tools below, which stay on the
+# INTERNAL_API_KEY / APPLICATION_API_URL machine-to-machine path.
+# CORS is handled by hand here (allow-listing FRONTEND_ORIGINS) rather than
+# via Starlette's CORSMiddleware, since FastMCP's high-level run() doesn't
+# give an easy hook to attach ASGI middleware and that surface has already
+# proven to shift across mcp SDK versions (see README).
+# ============================================================================
+
+
+def _cors_headers(request: Request) -> dict:
+    origin = request.headers.get("origin", "")
+    headers = {"Vary": "Origin"}
+    if origin in FRONTEND_ORIGINS:
+        headers["Access-Control-Allow-Origin"] = origin
+        headers["Access-Control-Allow-Credentials"] = "true"
+    return headers
+
+
+def _preflight(request: Request) -> Response:
+    headers = _cors_headers(request)
+    headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return Response(status_code=204, headers=headers)
+
+
+def _json(request: Request, payload: dict, status_code: int = 200) -> JSONResponse:
+    return JSONResponse(payload, status_code=status_code, headers=_cors_headers(request))
+
+
+@mcp.custom_route("/api/auth/register", methods=["POST", "OPTIONS"])
+async def register_fellow(request: Request):
+    if request.method == "OPTIONS":
+        return _preflight(request)
+
+    body = await request.json()
+    email = (body.get("email") or "").strip().lower()
+    if not email:
+        return _json(request, {"detail": "Email is required"}, 400)
+
+    _pending_registrations.append(
+        {
+            "name": body.get("name", ""),
+            "email": email,
+            "phone": body.get("phone", ""),
+            "requestedAt": body.get("requestedAt"),
+        }
+    )
+    # TODO: notify an admin instead of just holding this in memory.
+    return _json(request, {"status": "pending", "message": "Request recorded. Admin approval required."})
+
+
+@mcp.custom_route("/api/auth/google", methods=["POST", "OPTIONS"])
+async def google_login(request: Request):
+    if request.method == "OPTIONS":
+        return _preflight(request)
+
+    body = await request.json()
+    credential = body.get("credential")
+    if not credential:
+        return _json(request, {"detail": "Missing credential"}, 400)
+
+    try:
+        claims = google_id_token.verify_oauth2_token(credential, _google_request, GOOGLE_CLIENT_ID)
+    except ValueError:
+        return _json(request, {"detail": "Invalid Google token"}, 401)
+
+    email = (claims.get("email") or "").lower()
+    if not claims.get("email_verified", False):
+        return _json(request, {"detail": "Email not verified with Google"}, 401)
+
+    if ALLOWED_EMAILS and email not in ALLOWED_EMAILS:
+        # Valid Google account, but not an approved Fellow.
+        return _json(request, {"detail": "Not authorized"}, 403)
+
+    name = claims.get("name", "")
+    picture = claims.get("picture", "")
+    session_payload = {
+        "email": email,
+        "name": name,
+        "picture": picture,
+        "iat": int(time.time()),
+        "exp": int(time.time()) + SESSION_TTL_SECONDS,
+    }
+    token = jwt.encode(session_payload, SESSION_SECRET, algorithm="HS256")
+
+    response = _json(
+        request,
+        {
+            "token": "session-cookie",
+            "user": {
+                "name": name,
+                "email": email,
+                "picture": picture,
+                "provider": "google",
+                "role": "intelligence_fellow",
+            },
+        },
+    )
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=token,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        max_age=SESSION_TTL_SECONDS,
+        path="/",
+    )
+    return response
+
+
+@mcp.custom_route("/api/auth/session", methods=["GET", "OPTIONS"])
+async def session(request: Request):
+    if request.method == "OPTIONS":
+        return _preflight(request)
+
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    if not token:
+        return _json(request, {"detail": "Not authenticated"}, 401)
+    try:
+        claims = jwt.decode(token, SESSION_SECRET, algorithms=["HS256"])
+    except jwt.PyJWTError:
+        return _json(request, {"detail": "Session expired or invalid"}, 401)
+
+    return _json(
+        request,
+        {
+            "user": {
+                "name": claims.get("name", ""),
+                "email": claims["email"],
+                "picture": claims.get("picture", ""),
+                "provider": "google",
+                "role": "intelligence_fellow",
+            }
+        },
+    )
+
+
+@mcp.custom_route("/api/auth/logout", methods=["POST", "OPTIONS"])
+async def logout(request: Request):
+    if request.method == "OPTIONS":
+        return _preflight(request)
+
+    response = _json(request, {"ok": True})
+    response.delete_cookie(SESSION_COOKIE_NAME, path="/")
+    return response
 
 
 @mcp.tool()

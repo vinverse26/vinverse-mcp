@@ -1,0 +1,18 @@
+# The Application API this MCP server calls to fetch project data
+APPLICATION_API_URL=http://localhost:8000
+
+# Must match the INTERNAL_API_KEY set in the Application API's .env
+INTERNAL_API_KEY=change-this-to-a-shared-secret
+
+# Port this MCP server listens on (streamable-http transport)
+MCP_PORT=8001
+
+# --- Google Sign-In, called directly by vinverse-ui ---
+GOOGLE_CLIENT_ID=218306261814-r839n6kbu11copq7a1020jbamt8a376o.apps.googleusercontent.com
+
+SESSION_SECRET=1692e05ad56c41c1ef2ec23139b31aefb2b9c20be1e381295551a616f7dc2b36
+
+# TODO: replace with your real approved Fellows' Gmail addresses, comma-separated, no spaces
+ALLOWED_EMAILS=architect@vinverse.ai,you@gmail.com
+
+FRONTEND_ORIGINS=https://vinverse.ai,https://www.vinverse.ai,http://localhost:5173

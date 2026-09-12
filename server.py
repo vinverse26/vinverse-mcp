@@ -101,12 +101,23 @@ def _json(request: Request, payload: dict, status_code: int = 200) -> JSONRespon
     return JSONResponse(payload, status_code=status_code, headers=_cors_headers(request))
 
 
+async def _safe_json_body(request: Request) -> dict | None:
+    """Returns the parsed JSON body, or None if it's missing/malformed —
+    lets callers return a clean 400 instead of an unhandled 500."""
+    try:
+        return await request.json()
+    except Exception:
+        return None
+
+
 @mcp.custom_route("/api/auth/register", methods=["POST", "OPTIONS"])
 async def register_fellow(request: Request):
     if request.method == "OPTIONS":
         return _preflight(request)
 
-    body = await request.json()
+    body = await _safe_json_body(request)
+    if body is None:
+        return _json(request, {"detail": "Invalid request body"}, 400)
     email = (body.get("email") or "").strip().lower()
     if not email:
         return _json(request, {"detail": "Email is required"}, 400)
@@ -128,7 +139,9 @@ async def google_login(request: Request):
     if request.method == "OPTIONS":
         return _preflight(request)
 
-    body = await request.json()
+    body = await _safe_json_body(request)
+    if body is None:
+        return _json(request, {"detail": "Invalid request body"}, 400)
     credential = body.get("credential")
     if not credential:
         return _json(request, {"detail": "Missing credential"}, 400)
@@ -144,7 +157,11 @@ async def google_login(request: Request):
 
     if ALLOWED_EMAILS and email not in ALLOWED_EMAILS:
         # Valid Google account, but not an approved Fellow.
-        return _json(request, {"detail": "Not authorized"}, 403)
+        return _json(
+            request,
+            {"detail": "You are not an authorized user. Please register to request access."},
+            403,
+        )
 
     name = claims.get("name", "")
     picture = claims.get("picture", "")

@@ -29,6 +29,8 @@ from mcp.server.fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 
+from deploy_tool import register_deploy_tools
+
 APPLICATION_API_URL = os.getenv("APPLICATION_API_URL", "http://localhost:8000")
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "dev-internal-key-change-me")
 
@@ -61,6 +63,11 @@ mcp = FastMCP(
     host="0.0.0.0",
     port=int(os.getenv("MCP_PORT", "8001")),
 )
+
+# Adds the deploy_app / deploy_app_status tools (see deploy_tool.py) --
+# provisions the AWS pipeline for a new repo and deploys it, the same way
+# this repo deploys itself.
+register_deploy_tools(mcp)
 
 
 @mcp.custom_route("/health", methods=["GET"])

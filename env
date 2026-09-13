@@ -16,3 +16,13 @@ SESSION_SECRET=1692e05ad56c41c1ef2ec23139b31aefb2b9c20be1e381295551a616f7dc2b36
 ALLOWED_EMAILS=architect@vinverse.ai,you@gmail.com
 
 FRONTEND_ORIGINS=https://vinverse.ai,https://www.vinverse.ai,http://localhost:5173
+
+# --- deploy_app / deploy_app_status tool (see deploy_tool.py) ---
+# Put your own fine-grained PAT here for LOCAL testing only -- never commit
+# a real value. In production this is injected from the DEPLOY_GITHUB_TOKEN
+# GitHub Actions secret instead (see .github/workflows/deploy.yml).
+GITHUB_TOKEN=
+GITHUB_ORG=vinverse26
+AWS_ACCOUNT_ID=503947800630
+AWS_REGION=us-east-1
+ROOT_DOMAIN=vinverse.ai

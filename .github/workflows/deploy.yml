@@ -47,6 +47,9 @@ jobs:
           cluster: default
           container-port: 8001
           health-check-path: /health
+          # Lets the running container itself call AWS APIs (iam/ecr/ecs/elbv2)
+          # for deploy_tool.py's automation. See scripts/bootstrap_mcp_runtime_role.py.
+          task-role-arn: arn:aws:iam::503947800630:role/vinverse-mcp-runtime-role
           environment-variables: |
             [
               {"name": "APPLICATION_API_URL", "value": "${{ secrets.APPLICATION_API_URL }}"},
@@ -55,5 +58,10 @@ jobs:
               {"name": "GOOGLE_CLIENT_ID", "value": "${{ secrets.GOOGLE_CLIENT_ID }}"},
               {"name": "SESSION_SECRET", "value": "${{ secrets.SESSION_SECRET }}"},
               {"name": "ALLOWED_EMAILS", "value": "${{ secrets.ALLOWED_EMAILS }}"},
-              {"name": "FRONTEND_ORIGINS", "value": "${{ secrets.FRONTEND_ORIGINS }}"}
+              {"name": "FRONTEND_ORIGINS", "value": "${{ secrets.FRONTEND_ORIGINS }}"},
+              {"name": "GITHUB_TOKEN", "value": "${{ secrets.DEPLOY_GITHUB_TOKEN }}"},
+              {"name": "GITHUB_ORG", "value": "vinverse26"},
+              {"name": "AWS_ACCOUNT_ID", "value": "503947800630"},
+              {"name": "AWS_REGION", "value": "us-east-1"},
+              {"name": "ROOT_DOMAIN", "value": "vinverse.ai"}
             ]

@@ -68,6 +68,7 @@ ECS_INFRASTRUCTURE_ROLE_ARN = os.getenv(
     f"arn:aws:iam::{AWS_ACCOUNT_ID}:role/service-role/ecsInfrastructureRoleForExpressServices",
 )
 GITHUB_OIDC_ROLE_NAME = os.getenv("GITHUB_OIDC_ROLE_NAME", "github-actions-vinverse-org-deploy")
+AMPLIFY_SERVICE_ROLE_ARN = os.getenv("AMPLIFY_SERVICE_ROLE_ARN", "")
 
 GITHUB_API = "https://api.github.com"
 _gh_headers = {
@@ -81,6 +82,27 @@ _iam = _session.client("iam")
 _ecr = _session.client("ecr")
 _ecs = _session.client("ecs")
 _elbv2 = _session.client("elbv2")
+_amplify = _session.client("amplify")
+
+AMPLIFY_BUILD_SPEC = """\
+version: 1
+frontend:
+  phases:
+    preBuild:
+      commands:
+        - npm ci
+    build:
+      commands:
+        - npm run build
+  artifacts:
+    baseDirectory: build
+    files:
+      - '**/*'
+  cache:
+    paths:
+      - node_modules/**/*
+"""
+
 
 FALLBACK_DOCKERFILES = {
     "python": """\
@@ -239,6 +261,20 @@ def ensure_ecr_repo(name: str) -> str:
 # ============================================================================
 
 
+def _gh_raise_for_status(r: httpx.Response) -> None:
+    """Surfaces GitHub's actual error message
+    (e.g. "Resource not accessible by personal access token") instead of just
+    the generic "403 Forbidden" -- that detail is what actually explains WHY,
+    and was previously only visible by testing the same call manually."""
+    if r.status_code < 400:
+        return
+    try:
+        detail = r.json().get("message", r.text)
+    except Exception:  # noqa: BLE001
+        detail = r.text
+    raise RuntimeError(f"GitHub API {r.status_code} for {r.request.method} {r.request.url}: {detail}")
+
+
 def ensure_github_repo(owner: str, repo: str, branch: str = "main") -> bool:
     """
     Creates the GitHub repo if it doesn't exist yet, with auto_init=True so
@@ -251,7 +287,7 @@ def ensure_github_repo(owner: str, repo: str, branch: str = "main") -> bool:
     if r.status_code == 200:
         return False
     if r.status_code != 404:
-        r.raise_for_status()
+        _gh_raise_for_status(r)
 
     # Try creating under the org first (the common case here); fall back to
     # the authenticated user's own account if `owner` isn't an org the token
@@ -260,7 +296,7 @@ def ensure_github_repo(owner: str, repo: str, branch: str = "main") -> bool:
     r = httpx.post(f"{GITHUB_API}/orgs/{owner}/repos", headers=_gh_headers, json=body, timeout=20)
     if r.status_code >= 400:
         r = httpx.post(f"{GITHUB_API}/user/repos", headers=_gh_headers, json=body, timeout=20)
-    r.raise_for_status()
+    _gh_raise_for_status(r)
 
     # auto_init creates the repo's *default* branch, which may not be named
     # "main" depending on the account/org's settings -- if our target branch
@@ -268,7 +304,7 @@ def ensure_github_repo(owner: str, repo: str, branch: str = "main") -> bool:
     default_branch = r.json().get("default_branch", "main")
     if default_branch != branch:
         ref = httpx.get(f"{GITHUB_API}/repos/{owner}/{repo}/git/ref/heads/{default_branch}", headers=_gh_headers, timeout=15)
-        ref.raise_for_status()
+        _gh_raise_for_status(ref)
         sha = ref.json()["object"]["sha"]
         httpx.post(
             f"{GITHUB_API}/repos/{owner}/{repo}/git/refs",
@@ -287,7 +323,7 @@ def _github_get_file_sha(owner: str, repo: str, path: str, branch: str) -> str |
         return r.json()["sha"]
     if r.status_code == 404:
         return None
-    r.raise_for_status()
+    _gh_raise_for_status(r)
     return None
 
 
@@ -297,13 +333,13 @@ def github_put_file(owner: str, repo: str, path: str, content: str, message: str
     if sha:
         body["sha"] = sha
     r = httpx.put(f"{GITHUB_API}/repos/{owner}/{repo}/contents/{path}", headers=_gh_headers, json=body, timeout=20)
-    r.raise_for_status()
+    _gh_raise_for_status(r)
     return r.json()
 
 
 def github_set_secret(owner: str, repo: str, secret_name: str, secret_value: str) -> None:
     r = httpx.get(f"{GITHUB_API}/repos/{owner}/{repo}/actions/secrets/public-key", headers=_gh_headers, timeout=15)
-    r.raise_for_status()
+    _gh_raise_for_status(r)
     key_info = r.json()
 
     public_key = public.PublicKey(key_info["key"].encode(), encoding.Base64Encoder())
@@ -313,7 +349,7 @@ def github_set_secret(owner: str, repo: str, secret_name: str, secret_value: str
     r = httpx.put(
         f"{GITHUB_API}/repos/{owner}/{repo}/actions/secrets/{secret_name}", headers=_gh_headers, json=body, timeout=15
     )
-    r.raise_for_status()
+    _gh_raise_for_status(r)
 
 
 def github_latest_workflow_run(owner: str, repo: str, workflow_file: str = "deploy.yml") -> dict | None:
@@ -325,7 +361,7 @@ def github_latest_workflow_run(owner: str, repo: str, workflow_file: str = "depl
     )
     if r.status_code == 404:
         return None
-    r.raise_for_status()
+    _gh_raise_for_status(r)
     runs = r.json().get("workflow_runs", [])
     return runs[0] if runs else None
 
@@ -453,8 +489,105 @@ def deploy_backend(
     }
 
 
+# ============================================================================
+# React path: AWS Amplify Hosting (same approach as vinverse-ui)
+# ============================================================================
+
+
+def _find_amplify_app_by_name(name: str) -> str | None:
+    paginator = _amplify.get_paginator("list_apps")
+    for page in paginator.paginate():
+        for app in page["apps"]:
+            if app["name"] == name:
+                return app["appId"]
+    return None
+
+
+def _ensure_amplify_app(app_name: str, github_repo: str) -> str:
+    existing_app_id = _find_amplify_app_by_name(app_name)
+
+    if existing_app_id:
+        _amplify.update_app(appId=existing_app_id, repository=github_repo, buildSpec=AMPLIFY_BUILD_SPEC)
+        return existing_app_id
+
+    create_kwargs = dict(
+        name=app_name,
+        repository=github_repo,
+        platform="WEB",
+        buildSpec=AMPLIFY_BUILD_SPEC,
+        autoBranchCreationConfig={"enableAutoBuild": True},
+    )
+    # Lets Amplify actually clone/build the repo without a manual console
+    # connection step. Fine-grained PATs work for this in most cases; if
+    # Amplify rejects it, the app is still created and you can connect the
+    # repo manually once from the Amplify console (Hosting -> your app ->
+    # "Connect branch").
+    if GITHUB_TOKEN:
+        create_kwargs["accessToken"] = GITHUB_TOKEN
+    if AMPLIFY_SERVICE_ROLE_ARN:
+        create_kwargs["iamServiceRoleArn"] = AMPLIFY_SERVICE_ROLE_ARN
+
+    resp = _amplify.create_app(**create_kwargs)
+    return resp["app"]["appId"]
+
+
+def _ensure_amplify_branch(app_id: str, branch: str) -> None:
+    try:
+        _amplify.get_branch(appId=app_id, branchName=branch)
+    except _amplify.exceptions.NotFoundException:
+        _amplify.create_branch(appId=app_id, branchName=branch, enableAutoBuild=True)
+
+
+def _ensure_amplify_domain(app_id: str, app_name: str, branch: str) -> None:
+    try:
+        _amplify.get_domain_association(appId=app_id, domainName=ROOT_DOMAIN)
+        action = _amplify.update_domain_association
+    except _amplify.exceptions.NotFoundException:
+        action = _amplify.create_domain_association
+
+    action(appId=app_id, domainName=ROOT_DOMAIN, subDomainSettings=[{"prefix": app_name, "branchName": branch}])
+
+
+def deploy_react(repo_name: str, github_repo: str, branch: str = "main") -> dict:
+    owner, repo = _split_owner_repo(github_repo)
+    app_name = dns_safe(repo_name)
+
+    repo_created = ensure_github_repo(owner, repo, branch)
+    app_id = _ensure_amplify_app(app_name, github_repo)
+    _ensure_amplify_branch(app_id, branch)
+
+    try:
+        _ensure_amplify_domain(app_id, app_name, branch)
+        domain_note = f"Amplify domain association created for {app_name}.{ROOT_DOMAIN} -- check the Amplify console for the verification CNAME to add in Cloudflare on first use."
+    except Exception as exc:  # noqa: BLE001 - domain setup is best-effort, don't fail the whole deploy over it
+        domain_note = f"Domain association failed ({exc}); the app itself was still created -- attach the domain manually in the Amplify console."
+
+    job = _amplify.start_job(appId=app_id, branchName=branch, jobType="RELEASE")
+
+    return {
+        "status": "triggered",
+        "github_repo_created": repo_created,
+        "amplify_app_id": app_id,
+        "job_id": job["jobSummary"]["jobId"],
+        "pipeline_console_url": f"https://{AWS_REGION}.console.aws.amazon.com/amplify/home?region={AWS_REGION}#/{app_id}",
+        "url": f"https://{app_name}.{ROOT_DOMAIN}",
+        "note": domain_note,
+    }
+
+
 def deploy_status(repo_name: str, project_type: str, github_repo: str | None = None) -> dict:
     app_name = dns_safe(repo_name)
+
+    if project_type == "react":
+        result: dict = {"repo_name": repo_name}
+        app_id = _find_amplify_app_by_name(app_name)
+        if not app_id:
+            return {"repo_name": repo_name, "error": "Amplify app not found for this repo"}
+        jobs = _amplify.list_jobs(appId=app_id, branchName="main", maxResults=1).get("jobSummaries", [])
+        result["job_status"] = jobs[0]["status"] if jobs else "UNKNOWN"
+        result["url"] = f"https://{app_name}.{ROOT_DOMAIN}"
+        return result
+
     service_name = f"{app_name}-svc"
     result: dict = {"repo_name": repo_name, "service_name": service_name}
 
@@ -521,18 +654,21 @@ def register_deploy_routes(mcp) -> None:
         if not all([repo_name, project_type, github_repo]):
             return JSONResponse({"detail": "repo_name, project_type, and github_repo are required"}, status_code=400)
 
-        if project_type not in ("python", "java"):
-            return JSONResponse({"detail": f"Unsupported project_type '{project_type}' for this route -- react apps deploy via Amplify instead."}, status_code=400)
+        if project_type not in ("python", "java", "react"):
+            return JSONResponse({"detail": f"Unsupported project_type '{project_type}' -- must be python, java, or react."}, status_code=400)
 
         try:
-            result = deploy_backend(
-                repo_name,
-                project_type,
-                github_repo,
-                body.get("branch", "main"),
-                body.get("container_port"),
-                body.get("health_check_path", "/"),
-            )
+            if project_type == "react":
+                result = deploy_react(repo_name, github_repo, body.get("branch", "main"))
+            else:
+                result = deploy_backend(
+                    repo_name,
+                    project_type,
+                    github_repo,
+                    body.get("branch", "main"),
+                    body.get("container_port"),
+                    body.get("health_check_path", "/"),
+                )
             return JSONResponse(result)
         except Exception as exc:  # noqa: BLE001
             log.exception("deploy_via_rest failed for %s", repo_name)
@@ -572,23 +708,28 @@ def register_deploy_tools(mcp) -> None:
 
         Args:
             repo_name: short app name, e.g. "vinverse_quant". Used as the
-                ECR repo name, ECS service name prefix, and subdomain.
-            project_type: "python" or "java". (React apps go through
-                Amplify separately, not this path.)
+                ECR repo name / Amplify app name, and the subdomain.
+            project_type: "python", "java", or "react". React apps deploy
+                via AWS Amplify Hosting; python/java deploy via ECS
+                Express Mode -- both create the pipeline and trigger the
+                first deploy automatically.
             github_repo: full URL, e.g. https://github.com/vinverse26/vinverse_quant
                 -- the repo is created here if it doesn't already exist.
             branch: branch the workflow triggers on (default "main").
             container_port: port the app listens on inside the container.
-                Defaults to 8000 for python, 8080 for java.
+                Defaults to 8000 for python, 8080 for java. Ignored for react.
             health_check_path: path the ALB health-checks (default "/").
+                Ignored for react.
 
         Idempotent: safe to call again after pushing new commits or
         changing settings -- updates the existing role/repo/workflow
         instead of duplicating anything.
         """
         try:
-            if project_type not in ("python", "java"):
-                return {"status": "error", "error": f"Unsupported project_type '{project_type}' for this tool -- react apps deploy via Amplify instead."}
+            if project_type not in ("python", "java", "react"):
+                return {"status": "error", "error": f"Unsupported project_type '{project_type}' -- must be python, java, or react."}
+            if project_type == "react":
+                return deploy_react(repo_name, github_repo, branch)
             return deploy_backend(repo_name, project_type, github_repo, branch, container_port, health_check_path)
         except Exception as exc:  # noqa: BLE001
             log.exception("deploy_app failed for %s", repo_name)

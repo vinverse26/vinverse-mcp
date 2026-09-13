@@ -60,6 +60,7 @@ jobs:
               {"name": "ALLOWED_EMAILS", "value": "${{ secrets.ALLOWED_EMAILS }}"},
               {"name": "FRONTEND_ORIGINS", "value": "${{ secrets.FRONTEND_ORIGINS }}"},
               {"name": "GITHUB_TOKEN", "value": "${{ secrets.DEPLOY_GITHUB_TOKEN }}"},
+              {"name": "DEPLOY_API_KEY", "value": "${{ secrets.DEPLOY_API_KEY }}"},
               {"name": "GITHUB_ORG", "value": "vinverse26"},
               {"name": "AWS_ACCOUNT_ID", "value": "503947800630"},
               {"name": "AWS_REGION", "value": "us-east-1"},

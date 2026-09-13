@@ -436,6 +436,80 @@ def deploy_status(repo_name: str, project_type: str, github_repo: str | None = N
     return result
 
 
+def register_deploy_routes(mcp) -> None:
+    """
+    Plain REST wrappers around deploy_app / deploy_app_status, so you can
+    curl/Postman these instead of speaking the MCP protocol -- useful for
+    quick testing, or for triggering a deploy from somewhere that isn't
+    an MCP client at all.
+
+    These sit alongside the MCP tools the same way /api/auth/* sits
+    alongside the project-data tools in server.py: same process, same
+    Starlette app, different protocol on the wire.
+
+    Protected by a shared header (X-Deploy-Key / DEPLOY_API_KEY) since
+    this can trigger real AWS/GitHub changes -- unlike /health, this
+    should never be left open on a public URL.
+    """
+    import os as _os
+
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse
+
+    DEPLOY_API_KEY = _os.getenv("DEPLOY_API_KEY", "")
+
+    def _check_key(request: Request) -> bool:
+        if not DEPLOY_API_KEY:
+            return False  # refuse to run wide open if nobody set a key
+        return request.headers.get("X-Deploy-Key") == DEPLOY_API_KEY
+
+    @mcp.custom_route("/api/deploy", methods=["POST"])
+    async def deploy_via_rest(request: Request):
+        if not _check_key(request):
+            return JSONResponse({"detail": "Missing or invalid X-Deploy-Key"}, status_code=401)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"detail": "Invalid JSON body"}, status_code=400)
+
+        repo_name = body.get("repo_name")
+        project_type = body.get("project_type")
+        github_repo = body.get("github_repo")
+        if not all([repo_name, project_type, github_repo]):
+            return JSONResponse({"detail": "repo_name, project_type, and github_repo are required"}, status_code=400)
+
+        if project_type not in ("python", "java"):
+            return JSONResponse({"detail": f"Unsupported project_type '{project_type}' for this route -- react apps deploy via Amplify instead."}, status_code=400)
+
+        try:
+            result = deploy_backend(
+                repo_name,
+                project_type,
+                github_repo,
+                body.get("branch", "main"),
+                body.get("container_port"),
+                body.get("health_check_path", "/"),
+            )
+            return JSONResponse(result)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("deploy_via_rest failed for %s", repo_name)
+            return JSONResponse({"repo_name": repo_name, "status": "error", "error": str(exc)}, status_code=500)
+
+    @mcp.custom_route("/api/deploy/status", methods=["GET"])
+    async def deploy_status_via_rest(request: Request):
+        if not _check_key(request):
+            return JSONResponse({"detail": "Missing or invalid X-Deploy-Key"}, status_code=401)
+
+        repo_name = request.query_params.get("repo_name")
+        project_type = request.query_params.get("project_type")
+        github_repo = request.query_params.get("github_repo")
+        if not repo_name or not project_type:
+            return JSONResponse({"detail": "repo_name and project_type query params are required"}, status_code=400)
+
+        return JSONResponse(deploy_status(repo_name, project_type, github_repo))
+
+
 def register_deploy_tools(mcp) -> None:
     """Call this once from server.py: register_deploy_tools(mcp)"""
 

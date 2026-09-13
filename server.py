@@ -29,7 +29,7 @@ from mcp.server.fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 
-from deploy_tool import register_deploy_tools
+from deploy_tool import register_deploy_routes, register_deploy_tools
 
 APPLICATION_API_URL = os.getenv("APPLICATION_API_URL", "http://localhost:8000")
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "dev-internal-key-change-me")
@@ -68,6 +68,10 @@ mcp = FastMCP(
 # provisions the AWS pipeline for a new repo and deploys it, the same way
 # this repo deploys itself.
 register_deploy_tools(mcp)
+# Plain REST equivalents (POST /api/deploy, GET /api/deploy/status) for
+# curling directly instead of going through an MCP client. Requires
+# X-Deploy-Key header matching the DEPLOY_API_KEY env var.
+register_deploy_routes(mcp)
 
 
 @mcp.custom_route("/health", methods=["GET"])

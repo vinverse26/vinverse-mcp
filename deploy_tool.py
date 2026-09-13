@@ -44,10 +44,14 @@ import base64
 import json
 import logging
 import os
+import shutil
+import subprocess
+import tempfile
 import time
 
 import boto3
 import httpx
+import jwt
 from nacl import encoding, public
 
 log = logging.getLogger("vinverse-mcp.deploy")
@@ -69,6 +73,19 @@ ECS_INFRASTRUCTURE_ROLE_ARN = os.getenv(
 )
 GITHUB_OIDC_ROLE_NAME = os.getenv("GITHUB_OIDC_ROLE_NAME", "github-actions-vinverse-org-deploy")
 AMPLIFY_SERVICE_ROLE_ARN = os.getenv("AMPLIFY_SERVICE_ROLE_ARN", "")
+
+# --- session cookie auth, so vinverse-ui can call /api/deploy directly from
+#     the browser using the SAME login session /api/auth/google already
+#     issues -- rather than exposing DEPLOY_API_KEY to every visitor. ---
+SESSION_SECRET = os.getenv("SESSION_SECRET", "")
+SESSION_COOKIE_NAME = "vinverse_session"
+FRONTEND_ORIGINS = {
+    o.strip()
+    for o in os.getenv(
+        "FRONTEND_ORIGINS", "https://vinverse.ai,https://www.vinverse.ai,http://localhost:5173"
+    ).split(",")
+    if o.strip()
+}
 
 GITHUB_API = "https://api.github.com"
 _gh_headers = {
@@ -328,6 +345,16 @@ def _github_get_file_sha(owner: str, repo: str, path: str, branch: str) -> str |
 
 
 def github_put_file(owner: str, repo: str, path: str, content: str, message: str, branch: str = "main") -> dict:
+    """
+    NOTE: kept for reference/other uses, but deploy_backend no longer calls
+    this for committing the Dockerfile/workflow -- see git_commit_files
+    below. Some accounts (typically newly created ones) get a 403
+    "Resource not accessible by personal access token" specifically on
+    this Contents API write endpoint, even with full token scope and an
+    existing repo/branch. Plain `git push` has proven reliable for the
+    same account/token where this API call is not, so file commits go
+    through a real git clone+push instead.
+    """
     sha = _github_get_file_sha(owner, repo, path, branch)
     body = {"message": message, "content": base64.b64encode(content.encode()).decode(), "branch": branch}
     if sha:
@@ -335,6 +362,62 @@ def github_put_file(owner: str, repo: str, path: str, content: str, message: str
     r = httpx.put(f"{GITHUB_API}/repos/{owner}/{repo}/contents/{path}", headers=_gh_headers, json=body, timeout=20)
     _gh_raise_for_status(r)
     return r.json()
+
+
+def _scrub_token(text: str) -> str:
+    """Never let the token itself leak into an error message, log line, or
+    API response -- git's own error output sometimes echoes the remote URL,
+    which embeds the token."""
+    if GITHUB_TOKEN and GITHUB_TOKEN in text:
+        return text.replace(GITHUB_TOKEN, "***")
+    return text
+
+
+def _run_git(args: list[str], cwd: str, timeout: int = 60) -> None:
+    result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    if result.returncode != 0:
+        raise RuntimeError(f"git {args[0]} failed: {_scrub_token(result.stderr.strip())}")
+
+
+def git_commit_files(owner: str, repo: str, branch: str, files: dict[str, str], message: str) -> bool:
+    """
+    Writes one or more files into a repo via a real `git clone` -> write ->
+    `commit` -> `push`, authenticating with GITHUB_TOKEN as the HTTPS
+    credential -- this is the workaround for the Contents API restriction
+    described in github_put_file's docstring above.
+
+    Returns True if a commit was actually pushed, False if the files were
+    already identical to what's there (nothing to do).
+    """
+    clone_url = f"https://{GITHUB_TOKEN}@github.com/{owner}/{repo}.git"
+    tmp_dir = tempfile.mkdtemp(prefix="deploy_app_git_")
+    try:
+        _run_git(["clone", "--quiet", clone_url, tmp_dir], cwd=tempfile.gettempdir())
+        _run_git(["checkout", "-B", branch], cwd=tmp_dir)
+
+        for rel_path, content in files.items():
+            full_path = os.path.join(tmp_dir, rel_path)
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            with open(full_path, "w", encoding="utf-8", newline="") as f:
+                f.write(content)
+
+        _run_git(["config", "user.email", "deploy-app@vinverse.ai"], cwd=tmp_dir)
+        _run_git(["config", "user.name", "vinverse-deploy-app"], cwd=tmp_dir)
+        _run_git(["add", "-A"], cwd=tmp_dir)
+
+        # Exit code 0 = no staged changes, 1 = there are changes, anything
+        # else is a real error worth surfacing.
+        diff_check = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=tmp_dir)
+        if diff_check.returncode == 0:
+            return False
+        if diff_check.returncode != 1:
+            raise RuntimeError("git diff --cached check failed unexpectedly")
+
+        _run_git(["commit", "--quiet", "-m", message], cwd=tmp_dir)
+        _run_git(["push", "--quiet", "origin", f"HEAD:{branch}"], cwd=tmp_dir)
+        return True
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def github_set_secret(owner: str, repo: str, secret_name: str, secret_value: str) -> None:
@@ -467,25 +550,29 @@ def deploy_backend(
     oidc_role_arn = ensure_shared_oidc_role()
     ecr_uri = ensure_ecr_repo(app_name)
 
+    files_to_commit: dict[str, str] = {}
     if repo_created or _github_get_file_sha(owner, repo, "Dockerfile", branch) is None:
-        github_put_file(
-            owner, repo, "Dockerfile", FALLBACK_DOCKERFILES[project_type],
-            "Add Dockerfile (auto-generated by deploy_app)", branch,
-        )
+        files_to_commit["Dockerfile"] = FALLBACK_DOCKERFILES[project_type]
 
     workflow_yaml = _build_workflow_yaml(app_name, app_name, port, oidc_role_arn, health_check_path)
-    github_put_file(
-        owner, repo, ".github/workflows/deploy.yml", workflow_yaml,
-        "Add/update ECS Express deploy workflow (auto-generated by deploy_app)", branch,
+    files_to_commit[".github/workflows/deploy.yml"] = workflow_yaml
+
+    pushed = git_commit_files(
+        owner, repo, branch, files_to_commit,
+        "Add/update deploy pipeline (auto-generated by deploy_app)",
     )
 
     return {
-        "status": "triggered",
+        "status": "triggered" if pushed else "unchanged",
         "github_repo_created": repo_created,
         "ecr_repo_uri": ecr_uri,
         "service_name": f"{app_name}-svc",
         "workflow_runs_url": f"https://github.com/{owner}/{repo}/actions",
-        "note": "Committing the workflow file just triggered the first run. Call deploy_status to check progress and get the live endpoint once it's up.",
+        "note": (
+            "Committing the workflow file just triggered the first run. Call deploy_status to check progress and get the live endpoint once it's up."
+            if pushed else
+            "Dockerfile and workflow were already up to date -- nothing new was pushed. Call deploy_status to check the existing deployment, or push a code change yourself to trigger a new run."
+        ),
     }
 
 
@@ -613,49 +700,80 @@ def deploy_status(repo_name: str, project_type: str, github_repo: str | None = N
 
 def register_deploy_routes(mcp) -> None:
     """
-    Plain REST wrappers around deploy_app / deploy_app_status, so you can
-    curl/Postman these instead of speaking the MCP protocol -- useful for
-    quick testing, or for triggering a deploy from somewhere that isn't
-    an MCP client at all.
+    Plain REST wrappers around deploy_app / deploy_app_status, callable two
+    ways:
 
-    These sit alongside the MCP tools the same way /api/auth/* sits
-    alongside the project-data tools in server.py: same process, same
-    Starlette app, different protocol on the wire.
+      1. From the browser, as a logged-in-user feature in vinverse-ui -- the
+         SAME session cookie /api/auth/google already issues is accepted
+         here, so a logged-in Intelligence Fellow can trigger a deploy
+         without any separate secret ever reaching frontend code.
+      2. Server-to-server / manual testing (curl, Postman) -- via the
+         X-Deploy-Key header, matching DEPLOY_API_KEY.
 
-    Protected by a shared header (X-Deploy-Key / DEPLOY_API_KEY) since
-    this can trigger real AWS/GitHub changes -- unlike /health, this
-    should never be left open on a public URL.
+    Either is sufficient; you don't need both. CORS is handled by hand here,
+    the same way server.py does it for /api/auth/* -- for the same reason
+    (FastMCP's run() doesn't give an easy hook to attach ASGI middleware).
     """
     import os as _os
 
     from starlette.requests import Request
-    from starlette.responses import JSONResponse
+    from starlette.responses import JSONResponse, Response
 
     DEPLOY_API_KEY = _os.getenv("DEPLOY_API_KEY", "")
 
-    def _check_key(request: Request) -> bool:
-        if not DEPLOY_API_KEY:
-            return False  # refuse to run wide open if nobody set a key
-        return request.headers.get("X-Deploy-Key") == DEPLOY_API_KEY
+    def _cors_headers(request: Request) -> dict:
+        origin = request.headers.get("origin", "")
+        headers = {"Vary": "Origin"}
+        if origin in FRONTEND_ORIGINS:
+            headers["Access-Control-Allow-Origin"] = origin
+            headers["Access-Control-Allow-Credentials"] = "true"
+        return headers
 
-    @mcp.custom_route("/api/deploy", methods=["POST"])
+    def _preflight(request: Request) -> Response:
+        headers = _cors_headers(request)
+        headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        headers["Access-Control-Allow-Headers"] = "Content-Type, X-Deploy-Key"
+        return Response(status_code=204, headers=headers)
+
+    def _json(request: Request, payload: dict, status_code: int = 200) -> JSONResponse:
+        return JSONResponse(payload, status_code=status_code, headers=_cors_headers(request))
+
+    def _authorized(request: Request) -> bool:
+        # Path 1: logged-in session cookie (browser / vinverse-ui).
+        token = request.cookies.get(SESSION_COOKIE_NAME)
+        if token and SESSION_SECRET:
+            try:
+                jwt.decode(token, SESSION_SECRET, algorithms=["HS256"])
+                return True
+            except jwt.PyJWTError:
+                pass  # fall through to the header check below
+
+        # Path 2: shared header (server-to-server / manual testing).
+        if DEPLOY_API_KEY and request.headers.get("X-Deploy-Key") == DEPLOY_API_KEY:
+            return True
+
+        return False
+
+    @mcp.custom_route("/api/deploy", methods=["POST", "OPTIONS"])
     async def deploy_via_rest(request: Request):
-        if not _check_key(request):
-            return JSONResponse({"detail": "Missing or invalid X-Deploy-Key"}, status_code=401)
+        if request.method == "OPTIONS":
+            return _preflight(request)
+        if not _authorized(request):
+            return _json(request, {"detail": "Not authenticated -- log in, or provide a valid X-Deploy-Key"}, 401)
 
         try:
             body = await request.json()
         except Exception:
-            return JSONResponse({"detail": "Invalid JSON body"}, status_code=400)
+            return _json(request, {"detail": "Invalid JSON body"}, 400)
 
         repo_name = body.get("repo_name")
         project_type = body.get("project_type")
         github_repo = body.get("github_repo")
         if not all([repo_name, project_type, github_repo]):
-            return JSONResponse({"detail": "repo_name, project_type, and github_repo are required"}, status_code=400)
+            return _json(request, {"detail": "repo_name, project_type, and github_repo are required"}, 400)
 
         if project_type not in ("python", "java", "react"):
-            return JSONResponse({"detail": f"Unsupported project_type '{project_type}' -- must be python, java, or react."}, status_code=400)
+            return _json(request, {"detail": f"Unsupported project_type '{project_type}' -- must be python, java, or react."}, 400)
 
         try:
             if project_type == "react":
@@ -669,23 +787,25 @@ def register_deploy_routes(mcp) -> None:
                     body.get("container_port"),
                     body.get("health_check_path", "/"),
                 )
-            return JSONResponse(result)
+            return _json(request, result)
         except Exception as exc:  # noqa: BLE001
             log.exception("deploy_via_rest failed for %s", repo_name)
-            return JSONResponse({"repo_name": repo_name, "status": "error", "error": str(exc)}, status_code=500)
+            return _json(request, {"repo_name": repo_name, "status": "error", "error": str(exc)}, 500)
 
-    @mcp.custom_route("/api/deploy/status", methods=["GET"])
+    @mcp.custom_route("/api/deploy/status", methods=["GET", "OPTIONS"])
     async def deploy_status_via_rest(request: Request):
-        if not _check_key(request):
-            return JSONResponse({"detail": "Missing or invalid X-Deploy-Key"}, status_code=401)
+        if request.method == "OPTIONS":
+            return _preflight(request)
+        if not _authorized(request):
+            return _json(request, {"detail": "Not authenticated -- log in, or provide a valid X-Deploy-Key"}, 401)
 
         repo_name = request.query_params.get("repo_name")
         project_type = request.query_params.get("project_type")
         github_repo = request.query_params.get("github_repo")
         if not repo_name or not project_type:
-            return JSONResponse({"detail": "repo_name and project_type query params are required"}, status_code=400)
+            return _json(request, {"detail": "repo_name and project_type query params are required"}, 400)
 
-        return JSONResponse(deploy_status(repo_name, project_type, github_repo))
+        return _json(request, deploy_status(repo_name, project_type, github_repo))
 
 
 def register_deploy_tools(mcp) -> None:

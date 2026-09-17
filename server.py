@@ -235,7 +235,17 @@ async def google_login(request: Request):
     if not claims.get("email_verified", False):
         return _json(request, {"detail": "Email not verified with Google"}, 401)
 
-    approved_emails = get_approved_emails()
+    try:
+        approved_emails = get_approved_emails()
+    except Exception:  # noqa: BLE001
+        # Don't let a transient S3/IAM hiccup take down login entirely --
+        # fall back to the env var (the same value this would bootstrap
+        # from anyway) rather than crashing the request unhandled, which
+        # returns a bare 500 with no CORS headers and looks like login is
+        # completely broken client-side.
+        log.exception("Could not read approved-emails list from S3; falling back to ALLOWED_EMAILS env var")
+        approved_emails = {e.strip().lower() for e in os.getenv("ALLOWED_EMAILS", "").split(",") if e.strip()}
+
     if approved_emails and email not in approved_emails:
         # Valid Google account, but not an approved Fellow.
         return _json(

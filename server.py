@@ -283,7 +283,15 @@ async def google_login(request: Request):
         value=token,
         httponly=True,
         secure=True,
-        samesite="lax",
+        # "none" (not "lax"): the frontend (vinverse.ai, on Amplify) and this
+        # API (*.ecs.us-east-1.on.aws) are different sites, so every call
+        # from the browser to this API is cross-site from the cookie's point
+        # of view. A Lax cookie is only ever sent on top-level navigations,
+        # never on a background fetch/XHR to a different site -- so it was
+        # never being sent back on calls like GET /api/auth/register,
+        # despite login itself succeeding. "None" requires Secure, which is
+        # already set above.
+        samesite="none",
         max_age=SESSION_TTL_SECONDS,
         path="/",
     )

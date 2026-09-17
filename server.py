@@ -18,6 +18,7 @@ version, check `pip show mcp` and adjust — worst case, run with the default
 stdio transport and have the Orchestrator spawn this process directly instead
 of connecting over HTTP.
 """
+import logging
 import os
 import time
 
@@ -30,6 +31,9 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 
 from deploy_tool import register_deploy_routes, register_deploy_tools
+from storage import get_approved_emails, list_registrations, save_registration, set_registration_status
+
+log = logging.getLogger("vinverse-mcp.server")
 
 APPLICATION_API_URL = os.getenv("APPLICATION_API_URL", "http://localhost:8000")
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "dev-internal-key-change-me")
@@ -40,11 +44,10 @@ HEADERS = {"X-Internal-Key": INTERNAL_API_KEY}
 #     token only needs the client ID it was issued for (the "audience"). ---
 GOOGLE_CLIENT_ID = os.environ["GOOGLE_CLIENT_ID"]
 SESSION_SECRET = os.environ["SESSION_SECRET"]
-ALLOWED_EMAILS = {
-    e.strip().lower()
-    for e in os.environ.get("ALLOWED_EMAILS", "").split(",")
-    if e.strip()
-}
+# The Google Sign-In allow-list itself now lives in S3 (storage.py's
+# get_approved_emails) so approving a registration takes effect immediately,
+# with no redeploy -- ALLOWED_EMAILS here only seeds it the very first time,
+# before any approvals exist in S3. See _decide_registration below.
 FRONTEND_ORIGINS = {
     o.strip()
     for o in os.environ.get(
@@ -56,7 +59,6 @@ FRONTEND_ORIGINS = {
 SESSION_COOKIE_NAME = "vinverse_session"
 SESSION_TTL_SECONDS = 60 * 60 * 24 * 7  # 7 days
 _google_request = google_requests.Request()
-_pending_registrations: list[dict] = []  # in-memory placeholder, no DB yet
 
 mcp = FastMCP(
     "vinverse-mcp-server",
@@ -121,10 +123,23 @@ async def _safe_json_body(request: Request) -> dict | None:
         return None
 
 
-@mcp.custom_route("/api/auth/register", methods=["POST", "OPTIONS"])
+@mcp.custom_route("/api/auth/register", methods=["POST", "GET", "OPTIONS"])
 async def register_fellow(request: Request):
     if request.method == "OPTIONS":
         return _preflight(request)
+
+    if request.method == "GET":
+        # Admin-ish listing of the pending queue -- gated on being a
+        # signed-in, already-approved Fellow (there's no separate admin
+        # role yet), same session cookie /api/auth/google issues.
+        _claims, error = _require_approved_session(request)
+        if error:
+            return error
+        try:
+            return _json(request, {"registrations": list_registrations()})
+        except Exception:  # noqa: BLE001
+            log.exception("Failed to list registrations from S3")
+            return _json(request, {"detail": "Could not read registrations"}, 500)
 
     body = await _safe_json_body(request)
     if body is None:
@@ -133,16 +148,70 @@ async def register_fellow(request: Request):
     if not email:
         return _json(request, {"detail": "Email is required"}, 400)
 
-    _pending_registrations.append(
-        {
-            "name": body.get("name", ""),
-            "email": email,
-            "phone": body.get("phone", ""),
-            "requestedAt": body.get("requestedAt"),
-        }
+    record = {
+        "name": body.get("name", ""),
+        "email": email,
+        "phone": body.get("phone", ""),
+        "requestedAt": body.get("requestedAt") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    try:
+        reg_id = save_registration(record)
+    except Exception:  # noqa: BLE001
+        log.exception("Failed to persist registration for %s", email)
+        return _json(request, {"detail": "Could not record your request right now -- please try again shortly."}, 500)
+
+    return _json(
+        request,
+        {"status": "pending", "message": "Request recorded. Admin approval required.", "id": reg_id},
     )
-    # TODO: notify an admin instead of just holding this in memory.
-    return _json(request, {"status": "pending", "message": "Request recorded. Admin approval required."})
+
+
+def _require_approved_session(request: Request) -> tuple[dict | None, JSONResponse | None]:
+    """Shared gate for the approve/reject routes: must be a signed-in,
+    already-approved Fellow. Returns (claims, None) on success or
+    (None, error_response) on failure."""
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    if not token:
+        return None, _json(request, {"detail": "Not authenticated"}, 401)
+    try:
+        claims = jwt.decode(token, SESSION_SECRET, algorithms=["HS256"])
+    except jwt.PyJWTError:
+        return None, _json(request, {"detail": "Session expired or invalid"}, 401)
+    return claims, None
+
+
+async def _decide_registration(request: Request, status: str):
+    if request.method == "OPTIONS":
+        return _preflight(request)
+
+    _claims, error = _require_approved_session(request)
+    if error:
+        return error
+
+    reg_id = request.path_params["reg_id"]
+    try:
+        record = set_registration_status(reg_id, status)
+    except KeyError:
+        return _json(request, {"detail": f"No registration with id {reg_id}"}, 404)
+    except Exception:  # noqa: BLE001
+        log.exception("Failed to mark registration %s as %s", reg_id, status)
+        return _json(request, {"detail": "Could not update that registration"}, 500)
+
+    return _json(request, {"status": status, "registration": record})
+
+
+@mcp.custom_route("/api/auth/register/{reg_id}/approve", methods=["POST", "OPTIONS"])
+async def approve_registration(request: Request):
+    """Approves a pending registration: marks it approved in S3 and adds
+    the email to the live Google Sign-In allow-list immediately (no
+    redeploy needed) -- see storage.set_registration_status."""
+    return await _decide_registration(request, "approved")
+
+
+@mcp.custom_route("/api/auth/register/{reg_id}/reject", methods=["POST", "OPTIONS"])
+async def reject_registration(request: Request):
+    """Marks a pending registration rejected. Does not touch the allow-list."""
+    return await _decide_registration(request, "rejected")
 
 
 @mcp.custom_route("/api/auth/google", methods=["POST", "OPTIONS"])
@@ -166,7 +235,8 @@ async def google_login(request: Request):
     if not claims.get("email_verified", False):
         return _json(request, {"detail": "Email not verified with Google"}, 401)
 
-    if ALLOWED_EMAILS and email not in ALLOWED_EMAILS:
+    approved_emails = get_approved_emails()
+    if approved_emails and email not in approved_emails:
         # Valid Google account, but not an approved Fellow.
         return _json(
             request,

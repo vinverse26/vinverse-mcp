@@ -20,12 +20,16 @@ arn:aws:iam::503947800630:role/vinverse-mcp-runtime-role as
 task-role-arn, so nothing else needs editing once this exists.
 """
 import json
+import os
 import time
 
 import boto3
 
 ROLE_NAME = "vinverse-mcp-runtime-role"
 REGION = "us-east-1"
+AWS_ACCOUNT_ID = os.getenv("AWS_ACCOUNT_ID", "503947800630")
+# Must match storage.py's REGISTRATIONS_BUCKET default.
+REGISTRATIONS_BUCKET = os.getenv("REGISTRATIONS_BUCKET", f"vinverse-registrations-{AWS_ACCOUNT_ID}")
 
 TRUST_POLICY = {
     "Version": "2012-10-17",
@@ -64,6 +68,28 @@ PERMISSIONS_POLICY = {
             "Effect": "Allow",
             "Action": ["elasticloadbalancing:DescribeTargetGroups", "elasticloadbalancing:DescribeLoadBalancers"],
             "Resource": "*",
+        },
+        # For storage.py's S3-backed registration queue (see /api/auth/register).
+        # storage.py can also self-grant this at runtime (it reuses the
+        # iam:PutRolePolicy permission above), but granting it here up front
+        # avoids relying on that fallback.
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:CreateBucket",
+                "s3:PutBucketPublicAccessBlock",
+                "s3:PutEncryptionConfiguration",
+                "s3:PutLifecycleConfiguration",
+            ],
+            "Resource": f"arn:aws:s3:::{REGISTRATIONS_BUCKET}",
+        },
+        {
+            "Effect": "Allow",
+            "Action": ["s3:GetObject", "s3:PutObject", "s3:ListBucket", "s3:DeleteObject"],
+            "Resource": [
+                f"arn:aws:s3:::{REGISTRATIONS_BUCKET}",
+                f"arn:aws:s3:::{REGISTRATIONS_BUCKET}/*",
+            ],
         },
     ],
 }

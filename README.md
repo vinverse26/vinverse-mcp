@@ -16,10 +16,17 @@ Application API is a separate piece you still need to stand up (or point
 
 This service additionally exposes plain REST endpoints
 (`/api/auth/google`, `/api/auth/logout`, `/api/auth/session`,
-`/api/auth/register`) that `vinverse-ui` calls directly for login. These
-ride alongside the MCP protocol on the same Starlette app but are otherwise
-unrelated to the tools below — they authenticate real users with a session
-cookie, not the `INTERNAL_API_KEY` machine-to-machine path.
+`/api/auth/register`, `/api/auth/register/{id}/approve`,
+`/api/auth/register/{id}/reject`) that `vinverse-ui` calls directly for
+login. These ride alongside the MCP protocol on the same Starlette app but
+are otherwise unrelated to the tools below — they authenticate real users
+with a session cookie, not the `INTERNAL_API_KEY` machine-to-machine path.
+
+`POST /api/auth/register` (someone requesting access), `GET
+/api/auth/register` (an already-approved Fellow checking the pending
+queue), and the approve/reject endpoints are backed by a small S3 bucket —
+see `storage.py` and "Registration storage" below — rather than a real
+database, since there's no Application API/DB for this data yet.
 
 Worth knowing: this collapses two different trust boundaries (public
 user-facing auth, and an internal service-to-service tool layer) into one
@@ -117,6 +124,58 @@ existing role/workflow rather than duplicating anything.
 
 3. Push to `main`. The next deploy of vinverse-mcp itself will have
    both `deploy_app` tools live and able to act on other repos.
+
+## Registration storage: S3 as a minimal "database"
+
+`/api/auth/register` used to hold submissions in an in-memory Python list —
+wiped on every restart/redeploy. `storage.py` replaces that with an S3
+bucket (`vinverse-registrations-<AWS_ACCOUNT_ID>` by default, override with
+`REGISTRATIONS_BUCKET`), storing each registration as its own small JSON
+object under `registrations/`.
+
+S3 doesn't have a "bucket size" you provision up front the way a disk or an
+RDS instance does — it's pay-per-byte-actually-stored, and an empty bucket
+costs nothing. So there's no literal "5 MB bucket" setting; instead the
+footprint is kept tiny by construction (one small JSON object per
+registration, nothing duplicated) plus a lifecycle rule that expires
+registration objects after 90 days. Put a CloudWatch alarm on the bucket's
+`BucketSizeBytes` metric if you want a hard ceiling enforced.
+
+The bucket, its public-access block, encryption, and lifecycle rule are all
+created idempotently by the service itself on first use — no manual `aws s3
+mb` step. It needs the same runtime AWS permissions as `deploy_tool.py` (see
+below); `bootstrap_mcp_runtime_role.py` already grants them. If that script
+hasn't been re-run since this feature was added, the service will
+self-grant the S3 permissions it needs the first time `/api/auth/register`
+is hit (it reuses the `iam:PutRolePolicy` permission the runtime role
+already has on itself) — that's a one-time fallback, not the normal path.
+
+### Approving a registration -> letting them actually log in
+
+Registering and logging in are deliberately separate: filling in
+`POST /api/auth/register` only queues a request, it does not grant access.
+An already-approved Fellow (signed in via Google) can:
+
+- `GET /api/auth/register` — see everyone who has requested access, most
+  recent first (`{"registrations": [...]}`, each with `id`, `name`, `email`,
+  `phone`, `requestedAt`, `status`).
+- `POST /api/auth/register/{id}/approve` — marks that registration
+  `approved` **and** adds the email to the live Google Sign-In allow-list
+  immediately. No redeploy, no touching GitHub secrets — the allow-list
+  itself is stored in S3 (`config/approved_emails.json` in the same
+  bucket), read (with a 30-second cache) on every login attempt.
+- `POST /api/auth/register/{id}/reject` — marks it `rejected`; does not
+  touch the allow-list.
+
+The `ALLOWED_EMAILS` env var still works, but only as a one-time bootstrap:
+it seeds who can log in before any approvals exist in S3, so whoever is
+already listed there can sign in and start approving others. Once
+`config/approved_emails.json` exists, it's the source of truth and
+`ALLOWED_EMAILS` is no longer consulted.
+
+There's no separate "admin" role yet — any already-approved Fellow can
+approve/reject anyone else. Tighten `_require_approved_session` in
+`server.py` if that needs restricting to specific people later.
 
 ### Security note
 

@@ -154,7 +154,9 @@ already has on itself) — that's a one-time fallback, not the normal path.
 
 Registering and logging in are deliberately separate: filling in
 `POST /api/auth/register` only queues a request, it does not grant access.
-An already-approved Fellow (signed in via Google) can:
+Reviewing that queue is admin-only, gated by the `ADMIN_EMAILS` env var —
+distinct from `ALLOWED_EMAILS` (who can log in at all). Anyone in
+`ADMIN_EMAILS` (signed in via Google) can:
 
 - `GET /api/auth/register` — see everyone who has requested access, most
   recent first (`{"registrations": [...]}`, each with `id`, `name`, `email`,
@@ -167,15 +169,20 @@ An already-approved Fellow (signed in via Google) can:
 - `POST /api/auth/register/{id}/reject` — marks it `rejected`; does not
   touch the allow-list.
 
-The `ALLOWED_EMAILS` env var still works, but only as a one-time bootstrap:
-it seeds who can log in before any approvals exist in S3, so whoever is
-already listed there can sign in and start approving others. Once
-`config/approved_emails.json` exists, it's the source of truth and
-`ALLOWED_EMAILS` is no longer consulted.
+Anyone NOT in `ADMIN_EMAILS` gets a 403 from all three of the routes above,
+even if they're a perfectly valid, logged-in Fellow. If `ADMIN_EMAILS` is
+unset or empty, those routes are unreachable by anyone — it fails closed,
+not open, so forgetting to set it doesn't quietly hand admin to every
+Fellow. Set it as a GitHub Actions secret (`ADMIN_EMAILS`, comma-separated,
+no spaces) the same way `ALLOWED_EMAILS` is set.
 
-There's no separate "admin" role yet — any already-approved Fellow can
-approve/reject anyone else. Tighten `_require_approved_session` in
-`server.py` if that needs restricting to specific people later.
+The `ALLOWED_EMAILS` env var still works, but only as a one-time bootstrap
+for *login*: it seeds who can log in before any approvals exist in S3, so
+whoever is already listed there can sign in. Once
+`config/approved_emails.json` exists, it's the source of truth for login
+and `ALLOWED_EMAILS` is no longer consulted — but `ADMIN_EMAILS` (a
+separate, always-consulted env var) is what decides who can review/approve
+requests, regardless of the S3 allow-list's state.
 
 ### Security note
 

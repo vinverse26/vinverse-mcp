@@ -58,6 +58,7 @@ jobs:
               {"name": "GOOGLE_CLIENT_ID", "value": "${{ secrets.GOOGLE_CLIENT_ID }}"},
               {"name": "SESSION_SECRET", "value": "${{ secrets.SESSION_SECRET }}"},
               {"name": "ALLOWED_EMAILS", "value": "${{ secrets.ALLOWED_EMAILS }}"},
+              {"name": "ADMIN_EMAILS", "value": "${{ secrets.ADMIN_EMAILS }}"},
               {"name": "FRONTEND_ORIGINS", "value": "${{ secrets.FRONTEND_ORIGINS }}"},
               {"name": "GITHUB_TOKEN", "value": "${{ secrets.DEPLOY_GITHUB_TOKEN }}"},
               {"name": "DEPLOY_API_KEY", "value": "${{ secrets.DEPLOY_API_KEY }}"},

@@ -48,6 +48,13 @@ SESSION_SECRET = os.environ["SESSION_SECRET"]
 # get_approved_emails) so approving a registration takes effect immediately,
 # with no redeploy -- ALLOWED_EMAILS here only seeds it the very first time,
 # before any approvals exist in S3. See _decide_registration below.
+#
+# ADMIN_EMAILS is separate and deliberately stays a plain env var (not S3):
+# who can review/approve access requests is a much higher-stakes permission
+# than who can log in, so it's set explicitly at deploy time rather than
+# something one Fellow could grant another via the API. Empty means nobody
+# can access the admin routes -- fails closed, not open, if unconfigured.
+ADMIN_EMAILS = {e.strip().lower() for e in os.environ.get("ADMIN_EMAILS", "").split(",") if e.strip()}
 FRONTEND_ORIGINS = {
     o.strip()
     for o in os.environ.get(
@@ -129,10 +136,9 @@ async def register_fellow(request: Request):
         return _preflight(request)
 
     if request.method == "GET":
-        # Admin-ish listing of the pending queue -- gated on being a
-        # signed-in, already-approved Fellow (there's no separate admin
-        # role yet), same session cookie /api/auth/google issues.
-        _claims, error = _require_approved_session(request)
+        # Listing the pending queue is admin-only -- see ADMIN_EMAILS /
+        # _require_admin_session below.
+        _claims, error = _require_admin_session(request)
         if error:
             return error
         try:
@@ -166,10 +172,9 @@ async def register_fellow(request: Request):
     )
 
 
-def _require_approved_session(request: Request) -> tuple[dict | None, JSONResponse | None]:
-    """Shared gate for the approve/reject routes: must be a signed-in,
-    already-approved Fellow. Returns (claims, None) on success or
-    (None, error_response) on failure."""
+def _require_signed_in_session(request: Request) -> tuple[dict | None, JSONResponse | None]:
+    """Base gate: must be a signed-in Fellow (any valid session cookie).
+    Returns (claims, None) on success or (None, error_response) on failure."""
     token = request.cookies.get(SESSION_COOKIE_NAME)
     if not token:
         return None, _json(request, {"detail": "Not authenticated"}, 401)
@@ -180,11 +185,31 @@ def _require_approved_session(request: Request) -> tuple[dict | None, JSONRespon
     return claims, None
 
 
+def _require_admin_session(request: Request) -> tuple[dict | None, JSONResponse | None]:
+    """Gate for the access-request review routes (GET /api/auth/register,
+    approve, reject): must be signed in AND listed in ADMIN_EMAILS. This is
+    deliberately stricter than "any approved Fellow" -- reviewing/approving
+    who else gets in is a different, higher-stakes permission than just
+    being logged in. An empty ADMIN_EMAILS fails closed (denies everyone)
+    rather than silently falling back to "any Fellow can admin"."""
+    claims, error = _require_signed_in_session(request)
+    if error:
+        return None, error
+    email = (claims.get("email") or "").lower()
+    if not ADMIN_EMAILS:
+        return None, _json(
+            request, {"detail": "No admins are configured yet -- set the ADMIN_EMAILS env var."}, 403
+        )
+    if email not in ADMIN_EMAILS:
+        return None, _json(request, {"detail": "You do not have permission to manage access requests."}, 403)
+    return claims, None
+
+
 async def _decide_registration(request: Request, status: str):
     if request.method == "OPTIONS":
         return _preflight(request)
 
-    _claims, error = _require_approved_session(request)
+    _claims, error = _require_admin_session(request)
     if error:
         return error
 
@@ -275,6 +300,7 @@ async def google_login(request: Request):
                 "picture": picture,
                 "provider": "google",
                 "role": "intelligence_fellow",
+                "isAdmin": email in ADMIN_EMAILS,
             },
         },
     )
@@ -320,6 +346,7 @@ async def session(request: Request):
                 "picture": claims.get("picture", ""),
                 "provider": "google",
                 "role": "intelligence_fellow",
+                "isAdmin": claims["email"] in ADMIN_EMAILS,
             }
         },
     )
